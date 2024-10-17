@@ -1,26 +1,110 @@
-version: '3.8'
+networks:
+  esignet-network:
+    driver: bridge
+
+volumes:
+  signet-volume:
+    driver: local
+
+  openldap_data:
+    driver: local
 
 services:
-  database:
-    image: 'postgres:latest'
+  openldap:
+    image: 'bitnami/openldap:latest'
+    platform: linux/arm64
+    networks:
+      - esignet-network
     ports:
-      - 5455:5432
+      - '1389:1389'
+      - '1636:1636'
+    environment:
+      - LDAP_ADMIN_USERNAME=admin
+      - LDAP_ADMIN_PASSWORD=adminpassword
+      - LDAP_USERS=user01,user02
+      - LDAP_PASSWORDS=password1,password2
+      - LDAP_ROOT=dc=example,dc=org
+      - LDAP_ADMIN_DN=cn=admin,dc=example,dc=org
+    volumes:
+      - 'openldap_data:/bitnami/openldap'
+
+  mariadb-galera:
+    image: 'bitnami/mariadb-galera:latest'
+    platform: linux/arm64
+    networks:
+      - esignet-network
+    environment:
+      - MARIADB_ROOT_PASSWORD=root-password
+      - MARIADB_GALERA_MARIABACKUP_PASSWORD=backup-password
+      - MARIADB_USER=customuser
+      - MARIADB_DATABASE=customdatabase
+      - MARIADB_ENABLE_LDAP=yes
+      - LDAP_URI=ldap://openldap:1389
+      - LDAP_BASE=dc=example,dc=org
+      - LDAP_BIND_DN=cn=admin,dc=example,dc=org
+      - LDAP_BIND_PASSWORD=adminpassword
+
+  database:
+    image: 'postgres:17.0-alpine3.20'
+    platform: linux/arm64
+    networks:
+      - esignet-network
+    ports:
+      - '5455:5432'
     environment:
       - POSTGRES_USER=postgres
       - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=keycloak  # Database used by Keycloak
     volumes:
-      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+      - './init.sql:/docker-entrypoint-initdb.d/init.sql'
+
+  keycloak:
+    image: 'quay.io/keycloak/keycloak:26.0.0'
+    platform: linux/arm64
+    networks:
+      - esignet-network
+    environment:
+      - KC_BOOTSTRAP_ADMIN_USERNAME=admin
+      - KC_BOOTSTRAP_ADMIN_PASSWORD=admin
+      - KC_DB=postgres
+      - KC_DB_URL=jdbc:postgresql://database:5432/keycloak
+      - KC_DB_USERNAME=postgres
+      - KC_DB_PASSWORD=postgres
+      # - KC_PROXY=edge
+      - KC_HOSTNAME=localhost 
+      - KC_HOSTNAME_STRICT=false
+      - KC_HTTP_ENABLED=true
+      - KC_HEALTH_ENABLED=true
+      - KC_METRICS_ENABLED=true
+      - KC_LOG_LEVEL=info
+      - KC_HTTP_MANAGEMENT_PORT=9083
+      - KC_HTTP_MANAGEMENT_RELATIVE_PATH=/management
+      - KC_SPI_EVENTS_LISTENER_JBOSS_LOGGING_ERROR_LEVEL=debug
+    ports:
+      - "9083:9083"
+      - "8083:8080"  # HTTP
+      - "8443:8443"  # HTTPS
+    restart: always
+    depends_on:
+      - database
+    command: ["start-dev"]
 
   artifactory-server:
     image: 'mosipqa/artifactory-server:1.4.1-ES'
+    networks:
+      - esignet-network
     ports:
-      - 8080:8080
+      - '8080:8080'
+    volumes:
+      - 'signet-volume:/artifactory/data'
 
   mock-identity-system:
     image: 'mosipqa/mock-identity-system:0.9.x'
+    networks:
+      - esignet-network
     user: root
     ports:
-      - 8082:8082
+      - '8082:8082'
     environment:
       - artifactory_url_env=http://artifactory-server:8080/
       - container_user=mosip
@@ -33,31 +117,42 @@ services:
     volumes:
       - ./config/mock-identity-system-default.properties:/home/mosip/mock-identity-system-default.properties
 
-
   zookeeper:
-    image: wurstmeister/zookeeper
+    image: 'wurstmeister/zookeeper'
+    networks:
+      - esignet-network
     container_name: zookeeper
     ports:
-      - "2181:2181"
-      
+      - '2181:2181'
+    volumes:
+      - 'signet-volume:/var/lib/zookeeper'
+
   kafka:
-    image: wurstmeister/kafka
+    image: 'wurstmeister/kafka'
+    platform: linux/arm64
+    networks:
+      - esignet-network
     container_name: kafka
     ports:
-      - "9092:9092"
+      - '9092:9092'
+      - '9093:9093'
     environment:
-      KAFKA_ADVERTISED_LISTENERS: INSIDE://kafka:9092,OUTSIDE://localhost:9093
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INSIDE:PLAINTEXT,OUTSIDE:PLAINTEXT
-      KAFKA_LISTENERS: INSIDE://0.0.0.0:9092,OUTSIDE://0.0.0.0:9093
-      KAFKA_INTER_BROKER_LISTENER_NAME: INSIDE
-      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-      KAFKA_CREATE_TOPICS: "esignet-linked:1:1,esignet-consented:1:1"
+      - KAFKA_ADVERTISED_LISTENERS=INSIDE://kafka:9092,OUTSIDE://localhost:9093
+      - KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=INSIDE:PLAINTEXT,OUTSIDE:PLAINTEXT
+      - KAFKA_LISTENERS=INSIDE://0.0.0.0:9092,OUTSIDE://0.0.0.0:9093
+      - KAFKA_INTER_BROKER_LISTENER_NAME=INSIDE
+      - KAFKA_ZOOKEEPER_CONNECT=zookeeper:2181
+      - KAFKA_CREATE_TOPICS="esignet-linked:1:1,esignet-consented:1:1"
+    volumes:
+      - 'signet-volume:/var/lib/kafka'
 
   esignet:
     image: 'mosipqa/esignet:1.4.x'
+    networks:
+      - esignet-network
     user: root
     ports: 
-      - 8088:8088
+      - '8088:8088'
     environment:
       - artifactory_url_env=http://artifactory-server:8080/
       - container_user=mosip
@@ -74,9 +169,11 @@ services:
 
   esignet-ui:
     image: 'mosipqa/oidc-ui:1.4.x'
+    networks:
+      - esignet-network
     user: root
     ports: 
-      - 3000:3000
+      - '3000:3000'
     depends_on:
       - esignet
       - artifactory-server
